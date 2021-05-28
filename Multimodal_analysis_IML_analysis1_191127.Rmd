@@ -1,0 +1,1057 @@
+---
+title: "Multimodal Analysis Report"
+subtitle: "VDJ-HTO-ADT-GEX_library"
+date: " Last updated on `r format(Sys.time(), '%B %d, %Y')`"
+author: "Ana Ferreira"
+output:
+  html_document:
+    css: style.css
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    toc_depth: 3
+    number_sections: true
+---
+
+# An overview of the experiment
+
+This initial exploratory analysis aims to build upon our main goal which is to evaluate how multimodal analysis will potentially help our understanding of double positive (CD39+/CD103+) CD8 T cell identity in the tumor microenvironment context. Here we investigate these Trm and their repertoire across multiple tissue types. From previous publications and the focus of our lab, we have a priori understanding of these populations in Lung and Head & Neck cancers, but we also included in our analysis cells from RCC that have a flow cytometry profile of expressing CD4+/CD8+ T cells, potentially linked to immunotherapy response. Last, we have included 2 healthy control PBMC samples from same donor, one of them stimulated with Staph enterotoxin B (SEB) which is known to cause T cell activation via APC-MHC interaction. 
+
+Here's an example of our pre-processing pipeline with 10x Genomics 
+
+```{r pipe-fig, echo=FALSE, out.width='80%'}
+knitr::include_graphics('../fig/pre-processing.png')
+```
+
+And here's a summary of our Seurat pipeline approach:
+
+```{r pre-fig, echo=FALSE, out.width='80%'}
+knitr::include_graphics('../fig/pipelineOverview.png')
+```
+
+```{r load_libraries, echo=FALSE, message = FALSE, warning = FALSE}
+library(Seurat)
+library(tidyverse)
+library(sctransform)
+library(Matrix)
+library(magrittr) 
+```
+
+
+
+```{r loading_raw_data, results='hide',echo=FALSE, warning=FALSE, message=FALSE}
+#Both barcode and feature files from the CellRanger output of the gene expression pipeline were saved as .tsv.gz, however, when downloaded to my local computer, they were in .tsv format and binary. Running head on these files on the console will tell me if they need to be converted with gunzip in order for Seurat to be able to read it. The matrix file is downloaded as .gz and the .mtx extension seems to be important, so I just changed the ID name to the format used by the Read10x()
+raw.data <- Read10X(data.dir = "../filtered_feature_bc_matrix/")
+# load the RNAseq data
+rna.data <- raw.data$`Gene Expression` 
+# load the antibody capture assays and subset for downstream analysis
+adt.data <- raw.data$`Antibody Capture` 
+adt.data <- head(raw.data$`Antibody Capture`, n= 28) # for this experiment we used 28 ADTs
+hto.data<- tail(raw.data$`Antibody Capture`, n=5)  # and 5 HTOs
+```
+
+
+# Create Seurat Object with RNAseq count only
+
+```{r seurat_object, echo=FALSE}
+vdj.data <- CreateSeuratObject(counts = rna.data, project = "vdj_totalseqC")
+vdj.data 
+```
+
+# Add assays to Seurat Object, normalize and scale
+
+
+I follow this [post](https://www.biostars.org/p/383217/) to add the contigs and clonotype information to the Seurat object. The basic strategy is to load the contigs file, edit by removing barcode sufix to match the Seurat's object barcode name format, remove duplicated barcodes, edit the column containing the clonotypeID and merge this file with the clonotype csv file.
+
+Here's what is stored in the metadata for the Seurat object. We can add any information we want, as soon as the barcode for each cell matches our dataframe. 
+
+```{r meta_original, echo=FALSE}
+#look at the structure of the dataframes... 
+head(vdj.data@meta.data)
+```
+
+From the CellRanger vdj pipeline by 10x, we obtain multiple files containing important information about each cell alpha and beta pairing. Although, there are other methods available which we will explore later (GLIPH, TCRdist), for this initial integration analysis, we will work with the Cellranger output to obtain information about corresponding cells and their TCR rearrangement. 
+
+The _filtered contig_ file contains the 11,603 values and 18 columns. We use some of these to filter the data to remove non-cells and duplicates first, and subset to include only barcode and clonotypeID columns. For more information on how CellRanger vdj pipeline operates, check this [link](https://support.10xgenomics.com/single-cell-vdj/software/pipelines/latest/algorithms/annotation#productive), and for documentation of what these outputs mean.
+
+
+```{r filtered_contig, echo=FALSE}
+# load the filtered contig file 
+tcr <- read.csv("../filtered_contig_annotations.csv")
+# remove non-cells just to be sure (note that it's not a boolean, but rather a string value)
+tcr %>% filter(is_cell == 'True')
+# remove -1 at the end of each barcode name
+#tcr$barcode <- gsub("-1", "", tcr$barcode)
+# remove duplicates based on their barcode (should be unique for each cell)!
+# before removing duplicates= 11603 rows to 4805, which is a big drop!!
+# remember these are only coming from T cells, and not from other cells. 
+# it does not match HTO identified doublets
+tcr <- tcr[!duplicated(tcr$barcode), ]
+# edit the clonotype ID column name
+tcr <- tcr[, c("barcode", "raw_clonotype_id" )]
+names(tcr)[names(tcr) == "raw_clonotype_id"] <- "clonotype_id"
+```
+
+We use this smaller dataframe for merging and do a joint.
+
+
+```{r}
+head(tcr)
+```
+
+Load the _clonotype.csv_ and merge files based on clonotypeID with the information we want from both files into the object (barcode for cell ID, productive top 10 clonotypes based on frequency and proportion).
+
+
+```{r clonotypes, echo=FALSE}
+# load the clonotype csv file containing the 
+clono <- read.csv(paste("../clonotypes.csv", sep="")) # 1263 by 5
+head(clono, n= 10L) # columnames= clonotype_id, frequency, proportion 
+#dim(clono) 
+clono <- clono[1:9, c("clonotype_id","frequency", "proportion" )]
+```
+
+
+# Distribution of enriched clonotypes
+
+These clonotypes ordered by highest frequency will be tracked along the analysis.
+
+```{r dist_clono, echo=FALSE}
+# subset the large tcr merged file that was introduced initially in the object
+tcr_top10 <- clono
+#tcr_top10
+#dim(tcr_top10)
+# select only top 9 clonotypes for visualization
+ggplot(tcr_top10, aes(x=clonotype_id, y=frequency, fill=clonotype_id)) +
+  geom_bar(stat="identity")+
+  labs(title="Distribution of enriched clonotypes based on frequency ") +
+  scale_fill_brewer(palette = "RdBu") +
+  theme_classic()+
+  theme(axis.text=element_text(angle=45, hjust=1))
+```
+
+# Merge all data and add to Seurat object 
+
+Quick observation: this table shows a lot of NA values as expected (we are only interested in the top 10 based on frequency)
+
+```{r merge, echo=FALSE, message=FALSE, warning=FALSE}
+#Return all rows from x, and all columns from x and y. If there are multiple matches between x and y, all combination of the matches are returned. This is a mutating join.
+tcr <- left_join(tcr, clono)
+# In the object, the first column has no name and it is the originalID, so we apply the same here to this dataframe
+rownames(tcr) <- tcr[,1]
+tcr[,1] <- NULL
+head(tcr)
+```
+
+Here we subset and keep only the top clonotypes with associated frequency value (bringing the dataset to 392 only)
+
+```{r temp, echo=FALSE}
+temp <- as.data.frame(tcr)
+temp %>% filter(!is.na(frequency))
+```
+
+Verify if clonotype information has been successfully added to the metadata and how many we have for each clonotype_Id
+
+```{r verify_merge}
+# Add to the Seurat object's metadata.
+vdj.data <- AddMetaData(object=vdj.data, metadata=temp)
+head(vdj.data@meta.data)
+```
+
+In order to plot the distribution of the clonotypes on the UMAP, we first need to perform a few transformations, including changing from discrete (character) to continuous (numeric) data.
+
+```{r transform_clono, echo=FALSE}
+# remove clonotype word from clonotypeID column with gsub
+vdj.data@meta.data$clonotype_id <- gsub("clonotype", " ",vdj.data@meta.data$clonotype_id)
+#vdj.data@meta.data[51:60,]
+#switch classes to be able to plot the continuous data
+vdj.data@meta.data$clonotype_id <- as.numeric(vdj.data@meta.data$clonotype_id)
+class(vdj.data@meta.data$clonotype_id )
+```
+
+
+## Add an HTO as an independent assay and Normalize it with CLR (center-log ratio) method
+
+```{r create_hto_assay, echo=FALSE}
+# add HTO dataset as a new assay independent from RNA
+vdj.data[["HTO"]] <- CreateAssayObject(counts=hto.data)
+# Normalize HTO data, here we use centered log-ratio (CLR) transformation
+vdj.data <- NormalizeData(vdj.data, assay = "HTO", normalization.method = "CLR")
+vdj.data 
+```
+
+
+## Add the protein expression data to the Seurat object, normalize with the CLR method and scale it
+
+```{r create_adt_assay, echo=FALSE}
+vdj.data[["ADT"]] <- CreateAssayObject(counts = adt.data )
+vdj.data <- NormalizeData(vdj.data, assay = "ADT", normalization.method = "CLR")
+vdj.data <- ScaleData(vdj.data, assay = "ADT")
+vdj.data
+```
+
+```{r save1, echo=FALSE}
+saveRDS(vdj.data, file = "1.preFiltering_SeuratObject.rds")
+```
+
+
+# Perform QC on RNA data
+
+After having normalized ADT data, now we start working on the RNAseq data and performing QC steps with Seurat3.
+
+Let's flag mithocondrial genes and remove them before we proceed with other analysis. This is the first step in Seurat's suggested QC.
+
+Initially, there are only nCount_RNA/ADT nFeature_RNA/ADT stored as metadata. We are going to add an extra column with the information about genes starting with -MT and filter out later on. Note that this metadata also contains the ADT assay information beside the newly added % mitochondrial information
+
+
+Here we started with 18,331 cells from the filtered output files from Cellranger. Now let's make sure they are all healthy cells!
+
+```{r mito_filter, echo=FALSE}
+#head(vdj.data@meta.data)
+# This function takes a Seurat object, apply a regex pattern to match features against (starts with -MT) and assign to column in meta.data.
+vdj.data <- PercentageFeatureSet(object = vdj.data, 
+                                 pattern = "^MT-", 
+                                 col.name = "percent.mt") 
+head(vdj.data@meta.data) 
+```
+
+## Distribution of genes
+
+### Before filtering step
+
+```{r QC_Vln, echo=FALSE}
+VlnPlot(object = vdj.data, pt.size =0.8, cols= "red", features = c("nCount_ADT","nFeature_ADT", "nCount_HTO", "nFeature_HTO"), ncol = 4)
+VlnPlot(object = vdj.data, pt.size =0.8, cols= "red", features = c("nCount_RNA","nFeature_RNA", "percent.mt"), ncol = 3)
+```
+
+
+## Using Pearson correlation to compare feature-feature relationships
+
+FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+Here, we are looking at the correlation before filtering step of cells with high mitochondrial content (left) and gene expression of all cells.
+
+```{r pre_pearsonQC, echo=FALSE, message=FALSE, warning=FALSE}
+plot1 <- FeatureScatter(object = vdj.data, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "blue") + NoLegend() + FontSize(x.text = 9)
+plot2 <- FeatureScatter(object = vdj.data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + NoLegend() + FontSize(x.text = 9)
+CombinePlots(plots = list(plot1, plot2))
+```
+
+
+## Filtering step
+
+According to the Seurat's vignette, the authors suggest filtering based on nFeature(genes) those cells that have unique feature counts. We will remove cells with gene counts over 2500 (doublets?) AND less than 200 (mRNA in solution) AND cells that have >5% mitochondrial counts (apoptotic). For a full discussion of the metrics used here, check out Seurat's clustering [vignette](https://satijalab.org/seurat/v3.1/pbmc3k_tutorial.html) and the [paper](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4758103/) by _Ilicic et al_.
+
+### After filtering step
+
+```{r post_Vln, echo=FALSE}
+vdj.data <- subset(x = vdj.data, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+VlnPlot(object = vdj.data, pt.size =0.8, cols= "red", features = c("nCount_ADT","nCount_RNA","nFeature_RNA", "percent.mt"), ncol = 4)
+```
+
+
+```{r post_pearsonQC, echo=FALSE, message=FALSE, warning=FALSE}
+plot1 <- FeatureScatter(object = vdj.data, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "lightblue") + NoLegend() + FontSize(x.text = 9)
+plot2 <- FeatureScatter(object = vdj.data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + NoLegend() + FontSize(x.text = 9)
+CombinePlots(plots = list(plot1, plot2))
+```
+
+
+```{r save2, echo=FALSE}
+saveRDS(vdj.data, file = "./2.postFiltering_SeuratObject.rds")
+```
+
+
+# Apply the sctransform normalization
+
+"Improved methods for normalization. Seurat v3 includes support for sctransform, a new modeling approach for the normalization of single-cell data, described in a second [preprint](https://www.biorxiv.org/content/10.1101/576827v2). Compared to standard log-normalization, sctransform effectively removes technically-driven variation while preserving biological heterogeneity."
+
+"This single command replaces NormalizeData, ScaleData, and FindVariableFeatures from version2. Transformed data will be available in the SCT assay, which is set as the default after running sctransform. During normalization, we can also remove confounding sources of variation, for example, mitochondrial mapping percentage.  The FindVariableFeatures in Seurat2 (here applied as part of the sctransform function) aims to calculate a subset of features that exhibit high cell-to-cell variation in the dataset - highly expressed in some cells and lowly expressed in others. By focusing on these genes in downstream analysis helps highlight biological signal in single cell datasets.""
+
+
+```{r run_sctransform,echo=FALSE,  message = FALSE, warning = FALSE}
+## Use this function as an alternative to the NormalizeData, FindVariableFeatures, ScaleData workflow. Results are saved in a new assay (named SCT by default) with counts being (corrected) counts, data being log1p(counts), scale.data being pearson residuals; sctransform::vst intermediate results are saved in misc slot of new assay.
+# vars.to.regress: Variables to regress out in a second non-regularized linear regression. 
+# verbose = Whether to print messages and progress bars
+vdj.data <- SCTransform(object = vdj.data, 
+                        vars.to.regress = "percent.mt", 
+                        verbose = FALSE)
+vdj.data
+```
+
+# List highly expressed genes 
+
+```{r top_10GEX,echo=FALSE}
+top10 <- head(x = VariableFeatures(object = vdj.data), 10)
+top10
+```
+
+
+
+# Run PCA
+
+
+"Identifying the true dimensionality of a dataset can be challenging/uncertain. We therefore suggest these three approaches to consider. The first is more supervised, exploring PCs with _RunPCA_ function to determine relevant sources of heterogeneity, and could be used in conjunction with GSEA for example. The second, _JackStrawMethod_  implements a statistical test based on a random null model, but is time-consuming for large datasets, and may not return a clear PC cutoff. The third _ElbowPlot_ is a heuristic that is commonly used, and can be calculated instantly.Anything between PC 7-12 as a cutoff is justifiable."
+
+### First, perform linear dimensional reduction with PCA on the scaled data
+
+Genes positively or negatively associated with PC loadings are listed below.
+
+```{r runPCA, message=FALSE, warning= FALSE, echo=FALSE}
+vdj.data <- RunPCA(vdj.data, features = VariableFeatures(vdj.data))
+#vdj.data <- RunPCA(object = vdj.data, verbose = FALSE)
+# looking at the most significan PCs
+print(x = vdj.data[["pca"]], dims = 1:10, nfeatures = 10)
+```
+
+
+Elbow plot: a ranking of principal components based on the percentage of variance explained by each one (`ElbowPlot` function). It seems like the majority of true signal is captured in the first 3 PCs.
+
+
+```{r EP, echo=FALSE}
+ElbowPlot(object = vdj.data, ndims = 20)
+```
+
+
+```{r viz_load, echo=FALSE}
+#Visualize top genes associated with reduction components
+VizDimLoadings(object = vdj.data, dims = 1:2, reduction = "pca", nfeatures = 20)
+```
+
+
+"A DimHeatmap allows for easy exploration of the primary sources of heterogeneity in a dataset, and can be useful when trying to decide which PCs to include for further downstream analyses. Both cells and features are ordered according to their PCA scores. Setting cells to a number plots the ‘extreme’ cells on both ends of the spectrum, which dramatically speeds plotting for large datasets. Though clearly a supervised analysis, we find this to be a valuable tool for exploring correlated feature sets.This type of graph allows us to visualize sources of heterogeneity in the dataset."
+
+```{r allPCS, echo=FALSE}
+DimHeatmap(object = vdj.data, dims = 1:6, cells = 500, balanced = TRUE)
+DimHeatmap(object = vdj.data, dims = 7:12, cells = 500, balanced = TRUE)
+```
+
+
+After running diagnostics and reading the guided clustering tutorial, Seurat developers suggest selecting a number of PCs between 7-12 as a cutoff, so we will continue with **10 PCs** . 
+
+
+```{r save3, echo=FALSE}
+saveRDS(vdj.data, file = "./3.postPCA_SeuratObject.rds")
+```
+
+# Perform non-linear dimensional reduction
+
+"Seurat offers several non-linear dimensional reduction techniques, such as tSNE and UMAP, to visualize and explore these datasets. The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. Cells within the graph-based clusters determined above should co-localize on these dimension reduction plots. As input to the UMAP and tSNE, we suggest using the same PCs as input to the clustering analysis (in this case, I decided to use 10).""
+
+As expected, PCA is the least effective method when it comes to clustering due to its inherent linear approach. tSNE does a better job clustering based on gene expression, but since these cells are very transcriptionally similar, it ends up compromising the global structure of the data and favoring the local relationship. UMAP is the most recent method used for clustering, being faster and addressing some of the short-comings of tSNE.
+
+```{r compare, echo=FALSE, message=FALSE, warning=FALSE}
+ # run tSNE and UMAP  
+vdj.data<- RunTSNE(vdj.data, dims = 1:10, method = "FIt-SNE")
+vdj.data <- RunUMAP(object = vdj.data, umap.method = "uwot", metric = "cosine",  dims = 1:10, verbose = FALSE)
+# comparison of PCA, tSNE and UMAP on the RNAseq data
+DimPlot(object = vdj.data, reduction = "pca") + NoLegend()
+DimPlot(object = vdj.data, reduction = "tsne") + NoLegend()
+DimPlot(object = vdj.data, reduction = "umap") + NoLegend()
+```
+
+Now that we have defined how many PCs we want to use in our analysis and also visualized the distribution of the mixed populations with different clustering methods, let's check for batch effects and rerun the UMAP on singlets only.
+
+# Perform HTO analysis to remove doublets and verify batch effect
+
+
+After filtering steps of cells with high mitochondrial gene expression, we need to check for doublets and exclude them from the analysis. The hashtags allow for that, as well as checking for batch effect. We added the assay to our Seurat object earlier and normalized it already. Now we just follow the vignette.
+
+## Demultiplex cells based on HTO enrichment
+
+Use the HTODemux function  to assign single cells back to their sample origin. In this analysis we chose to use a  cutoff (positive.quantile) of 99%. Some preliminary analyis based on using a value between 80-99% showed that the lower you set the positive.quantile argument, the harder it is for Seurat to distinguish doublets from singlets. Here we use a high cutoff to avoid false-positives.
+
+```{r hto_demux1, echo=FALSE}
+vdj.data <- HTODemux(vdj.data, assay = "HTO", positive.quantile = .99)
+```
+
+## Visualize demultiplexing results with a table count and heatmap prior to removing doublets
+
+
+```{r table_HTOcount, echo=FALSE}
+table(vdj.data$HTO_classification.global)
+```
+
+
+```{r vizheatmap, echo=FALSE}
+HTOHeatmap(vdj.data, assay = "HTO", ncells = 5204) + RestoreLegend()
+```
+
+## Visualize enrichment for selected HTOs with ridge plots modified with log scaling the x-axis
+
+Compare our results to the Seurat [HTO](https://satijalab.org/seurat/v3.1/hashing_vignette.html) vignette. 
+
+```{r hto_ridgeplot1, echo=FALSE, warning=FALSE, message=FALSE}
+# Group cells based on the max HTO signal
+#Idents(vdj.data) <- "HTO_maxID"
+RidgePlot(vdj.data, assay = "HTO", features = rownames(vdj.data[["HTO"]])[1:2], log = T,  ncol =2 )
+RidgePlot(vdj.data, assay = "HTO", features = rownames(vdj.data[["HTO"]])[3:4], log = T,  ncol =2 )
+RidgePlot(vdj.data, assay = "HTO", features = rownames(vdj.data[["HTO"]])[5], log = T,  ncol =2 )
+```
+
+## Visualize pairs of HTO signals to confirm mutual exclusivity in singlets
+
+The function used by Seurat to plot a scatter plot, `FeatureScatter`, gives the option to 'pull data' from data, counts, or scale.data.
+
+We see that for pairwise correlation, doublets are located at the top right quadrant of the graph and Pearson correlation are very low as expected.
+
+### Data
+
+```{r hto_featurescatter1, echo=FALSE, warning=FALSE, message=FALSE}
+FeatureScatter(vdj.data, feature1 = "Hash1", feature2 = "Hash2", slot = "data")
+FeatureScatter(vdj.data, feature1 = "Hash3", feature2 = "Hash4", slot = "data")
+FeatureScatter(vdj.data, feature1 = "Hash1", feature2 = "Hash5", slot = "data")
+```
+
+### Counts
+
+```{r hto_featurescatter2, echo=FALSE, warning=FALSE, message=FALSE}
+FeatureScatter(vdj.data, feature1 = "Hash1", feature2 = "Hash2", slot = "counts")
+FeatureScatter(vdj.data, feature1 = "Hash3", feature2 = "Hash4", slot = "counts")
+FeatureScatter(vdj.data, feature1 = "Hash1", feature2 = "Hash5", slot = "counts")
+```
+
+## Compare number of nCountRNA (UMIs) distribution between hashtags
+
+
+```{r hto_singlets, echo=FALSE}
+#Idents(vdj.data) <- "HTO_classification.global"
+VlnPlot(vdj.data, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+```
+
+### Visualizing the distribution of doublets and clustering of hashtags
+
+
+We observe how hash2 (stimulated) sample cluster is distinct from others which share larger gene expression similarity. Doublets are present in all samples.
+
+```{r hto_tsne, echo=FALSE}
+#HTOHeatmap(vdj.data, assay = "HTO", ncells = 4153) + RestoreLegend()
+#Remove negative cells from the object
+vdj.data.subset <- subset(vdj.data, idents = "Negative", invert = TRUE)
+# Calculate a distance matrix using HTO
+hto.dist.mtx <- as.matrix(dist(t(GetAssayData(object = vdj.data.subset, assay = "HTO"))))
+# Calculate tSNE embeddings with a distance matrix
+#vdj.data.subset <- RunUMAP(object = hto.dist.mtx, umap.method = "umap-learn", metric = "correlation",  dims = 1:10, verbose = FALSE)
+vdj.data.subset <- RunTSNE(vdj.data.subset, distance.matrix = hto.dist.mtx, perplexity = 100)
+DimPlot(vdj.data.subset, label = T, repel = T,group.by = "ident") 
+```
+
+
+## Re-run the analysis using Singlets only and examine for potential presence of batch effects
+
+```{r singlet_sctransform, echo=FALSE, warning=FALSE, message=FALSE}
+# extract singlets
+vdj.data <- subset(vdj.data, idents = c("Negative", "Doublet"), invert = TRUE)
+#vdj.data <- subset(vdj.data, idents = "Singlet")
+head(vdj.data@active.ident)
+# normalize data
+vdj.data <- SCTransform(object = vdj.data, 
+                        vars.to.regress = "percent.mt", 
+                        verbose = FALSE)
+# Run PCA
+vdj.data <- RunPCA(vdj.data, features = VariableFeatures(vdj.data))
+```
+
+###  Confirm removal of doublets and negatives with heatmap
+
+
+```{r echo=FALSE}
+HTOHeatmap(vdj.data, assay = "HTO", ncells = 4153) + RestoreLegend()
+```
+
+
+# Apply graph-based clustering by building a shared-nearest-neighbors graph
+
+"Seurat v3 applies a graph-based clustering approach, building upon initial strategies in (Macosko et al). Importantly, the distance metric which drives the clustering analysis (based on previously identified PCs) remains the same. However, our approach to partitioning the cellular distance matrix into clusters has dramatically improved. Our approach was heavily inspired by recent manuscripts which applied graph-based clustering approaches to scRNA-seq data [SNN-Cliq](https://github.com/BIOINSu/SNN-Cliq) and CyTOF data [PhenoGraph](https://github.com/jacoblevine/PhenoGraph). 
+
+Briefly, these methods embed cells in a graph structure - for example a K-nearest neighbor (KNN) graph, with edges drawn between cells with similar feature expression patterns, and then attempt to partition this graph into highly interconnected ‘quasi-cliques’ or ‘communities’.
+
+As in _PhenoGraph_, we _first construct a KNN graph based on the euclidean distance in PCA space_, and _refine the edge weights between any two cells_ based on the shared overlap in their local neighborhoods (Jaccard similarity). 
+
+This step is performed using the `FindNeighbors` function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs)."
+
+```{r echo=FALSE, find_neighbors}
+vdj.data <- FindNeighbors(object = vdj.data, dims = 1:10, verbose = FALSE)
+```
+
+
+# Cluster using a modularity optimizer
+
+"To _cluster the cells_, we next _apply modularity optimization techniques_ such as the Louvain algorithm ("Fast unfolding of communities in large networks") or [SLM](http://www.ludowaltman.nl/slm/), to _iteratively group cells together_, with the goal of optimizing the standard modularity function. The FindClusters function implements this procedure, and contains a _resolution_ parameter that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters.
+
+We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the `Idents` function."
+
+
+Graphs the output of a dimensional reduction technique on a 2D scatter plot where each point is a cell and it's positioned based on the cell embeddings determined by the reduction technique.
+
+
+```{r echo=FALSE, find_clusters}
+vdj.data <- FindClusters(object = vdj.data, resolution = 0.5, verbose = F)
+```
+
+
+# Project HTOs from singlets on UMAP 
+
+
+```{r hto_tsne_single, echo=FALSE}
+#vdj.data.subset <- RunUMAP(object = vdj.data.subset, method= "umap-learn", metric= "correlation", dims = 1:10, verbose = FALSE)
+vdj.data.subset <- RunTSNE(vdj.data.subset, distance.matrix = hto.dist.mtx, perplexity = 100)
+DimPlot(vdj.data, group.by = "HTO_classification")
+```
+
+# Generate UMAP plot based on the _gene expression alone_
+
+
+```{r tSNEplot, echo= FALSE}
+# Dimensional reduction plot
+# By default, cells are colored by their identity class (can be changed with the group.by parameter)
+DimPlot(object = vdj.data, label = TRUE, group.by = "ident") 
+DimPlot(object = vdj.data, label = F, group.by = "hash.ID") 
+#vdj.data@meta.data
+```
+
+```{r save4, echo=FALSE}
+saveRDS(vdj.data, file = "./4.postClustering_SeuratObject.rds")
+```
+
+# RunUMAP on Continuous metadata
+
+
+On the next few plots mapping the metadata to the UMAP, I chose their standardization from previous publication papers: displaying RNA data in blue, Protein in green and VDJ data in red.
+
+_nCount_RNA_ expression for UMI counts overall for all cell types (helps verify any potential bias among populations). There's a small cluster with potential larger UMI levels compared to other clusters
+
+```{r nCountUMAP, echo=FALSE}
+FeaturePlot(vdj.data, features = c('nCount_RNA'), pt.size=0.5)
+```
+
+_Number of genes_ seems somewhat uniformly distributed among clusters
+
+```{r nfeatureRNA_UMAP,echo=FALSE}
+FeaturePlot(vdj.data, features = c('nFeature_RNA'), pt.size=0.5)
+```
+
+_Percent mitochondrial genes_ 
+
+```{r percent_mitoUMAP, echo=FALSE}
+FeaturePlot(vdj.data, features = c('percent.mt'), pt.size=0.5)
+```
+
+_(UMIs) cells with ADT count_
+
+```{r nCount_ADT_UMAP, echo=FALSE}
+FeaturePlot(vdj.data, features = c('nCount_ADT'), cols= c("lightgrey", "darkgreen"), pt.size=0.5)
+```
+
+
+```{r save5, echo=FALSE}
+saveRDS(vdj.data, file = "./5.ContinuousDist_SeuratObject.rds")
+```
+
+
+# Visualize marker genes 
+
+"Users can individually annotate clusters based on canonical markers. However, the sctransform normalization reveals sharper biological distinctions compared to the standard Seurat workflow, in a few ways:"
+
+>a) Clear separation of at least 3 CD8 T cell populations (naive, memory, effector), based on CD8A, GZMK, CCL5 expression
+>  
+>b) Clear separation of three CD4 T cell populations (naive, memory, IFN-activated) based on S100A4, CCR7, IL32, and ISG15
+>
+>c) Additional developmental sub-structure in B cell cluster, based on TCL1A, FCER2
+>
+>d) Additional separation of NK cells into CD56dim vs. bright clusters, based on XCL1 and FCGR3A(CD16)
+(Canonical marker genes as violin plots, based on Seurat's vignette recommendations. Violin plots show expression probability distributions across clusters.)
+
+Seurat's documentation uses the above general recommendation for annotating clusters, however, this process is highly arbitrary as it is a sparse type of data and there's no general consensus, such as protein markers in flow cytometry, for example. Here, we try to use their recommendation along with current "atlas" publications, especially when we analyze a specific type of cancer. The focus is centered on cells of the immune system because our data is sorted on CD45+, however, we understand that the TME is comprised of other important players such as fibroblasts, tumor cells, etc. 
+
+## CD8 T cells
+
+Based on Seurat's annotation for CD8 T cells correspond to clusters 2 and 6.
+
+```{r  CD8cluster, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("CD3D","CD8A","GZMK", "CCL5"), pt.size = 0.1, ncol = 2)
+FeaturePlot(object = vdj.data, features =  c("CD3D","CD8A","GZMK", "CCL5"), pt.size = 0.2, ncol = 2)
+```
+
+Now, let's take a deeper look with markers from _Puram et al_ publication:
+
+## Exhausted CD8+ T cells
+
+```{r  CD8cluster2, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("CD8A","LAG3", "TIGIT", "CTLA4"), pt.size = 0.1, ncol = 2)
+FeaturePlot(object = vdj.data, features =  c("CD8A","LAG3", "TIGIT", "CTLA4"), pt.size = 0.2, ncol = 2)
+```
+
+## Non-exhausted CD8 T cells: 
+
+```{r  CD8cluster3, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("CD8A","GZMA", "GZMB", "GZMH"), pt.size = 0.1, ncol = 2) 
+VlnPlot(object = vdj.data, features = c("CD8A","TNFRSF18", "ENTPD1", "ITGAE"), pt.size = 0.1, ncol = 2)
+VlnPlot(object = vdj.data, features = c("TNFRSF1A","TNFSF18", "TNFRSF4", "SIVA1"), pt.size = 0.1, ncol = 2)
+```
+
+
+## CD4 T cells
+
+Seurat identifies CCR7 and IL7R gene markers as Naive CD4 T cells which would be cluster 10, and memory CD4 as expressing IL7R and S100A4 (clusters 2, 6 and 10). These are based on pbmc experiments, so we are going to look at literature for HN TME.
+
+```{r CD4cluster1, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("CD4", "S100A4", "CCR7", "IL7R"), pt.size = 0.1, ncol = 2)
+#FeaturePlot(object = vdj.data, features =  c("CD4", "S100A4", "CCR7", "IL7R"), pt.size = 0.2, ncol = 2)
+```
+
+_Puram el al_ looked at Conventional CD4+ cells expressing CCR7 and TCF7 and Tregs expressing FOXP3 and CD25 (IL2RA). It seems really hard to characterize these subsets with gene expression only. We'll use our ADT soon. 
+
+```{r CD4cluster2, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("TCF7", "CCR7", "FOXP3", "IL2RA"), pt.size = 0.1, ncol = 2)
+```
+
+## Monocytes
+
+
+```{r  Monocluster, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("CD14", "LYZ", "FCGR3A", "MS4A7"), pt.size = 0.1, ncol = 2)
+#FeaturePlot(object = vdj.data, features =  c("CD14", "LYZ", "FCGR3A", "MS4A7"), pt.size = 0.2, ncol = 2)
+```
+
+## NK cells
+
+```{r NKcluster, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("NKG7", "GNLY"), pt.size = 0.1, ncol = 2)
+#FeaturePlot(object = vdj.data, features =  c("NKG7", "GNLY"), pt.size = 0.2, ncol = 2)
+```
+
+## Dendritic Cells and B cells
+
+Seurat's annotation markers for DC on pbmc are FCER1A and CST3, which also are highly expressed in cluster 10 (and many others). B cell markers seems to be restricted to cluster 5
+
+```{r DCandBcluster, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+VlnPlot(object = vdj.data, features = c("FCER1A", "CST3", "CD19", "MS4A1" ), pt.size = 0.1, ncol = 2)
+#FeaturePlot(object = vdj.data, features =  c("FCER1A", "CST3", "CD19", "MS4A1"), pt.size = 0.2,  ncol = 2)
+```
+
+
+## TGFB markers
+
+```{r epi_genes, echo=FALSE, results='hide', fig.keep='all'}
+VlnPlot(object = vdj.data, features = c("TGFB1", "TGFBR1", "TGFB3", "TGFBR2"), pt.size = 0.1, ncol = 2)
+
+```
+
+
+# Preliminary thoughts  on cluster annotation
+
+Here's the distribution per cluster of the top 10 genes and their expression per cluster
+Interestingly, IGKC and IGHG1 are immunoglobulin genes that should be expressed by B cells and it's very highly expressed in cluster 9 (check scale) and we don't see B cell gene markers in that cluster. A recent paper discusses how these could be a potential source of free floating RNA that has been captured, which makes me wonder about CITE-seq techniques where we used antibodies for the ADT. This could indicate that the sample is highly impure and further clean up should be done to correct for that. 
+
+```{r top10_VlnPlot1, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+first_four_top10 <- top10[1:4]
+other_six_top10 <- top10[5:10]
+VlnPlot(object = vdj.data, features = first_four_top10, pt.size = 0.1, ncol = 2)
+VlnPlot(object = vdj.data, features = other_six_top10, pt.size = 0.1, ncol = 3)
+```
+
+## ADT gene list from experimental design
+
+I was also curious to know how the genes from our ADT list would correspond to their distribution (CD107 protein is encoded by gene LAMP1)
+
+```{r ADT_genes, echo=FALSE, results='hide', fig.keep='all'}
+adt_geneList1 <- c("CD3D", "CD3E" ,"ITGAX", "ITGAM", "IRF8", "IL3RA")
+adt_geneList2 <- c("TFRC", "PDCD1", "CD274", "LAG3", "HAVCR2", "TNFRSF4")
+adt_geneList3 <- c("LAMP1", "CD69", "HLA-DRB1","CD163" , "MRC1", "KLRB1")
+#plots
+VlnPlot(object = vdj.data, features = adt_geneList1, pt.size = 0.1, ncol = 3)
+VlnPlot(object = vdj.data, features = adt_geneList2, pt.size = 0.1, ncol = 3)
+VlnPlot(object = vdj.data, features = adt_geneList3, pt.size = 0.1, ncol = 3)
+```
+
+```{r save6, echo=FALSE}
+saveRDS(vdj.data, file = "./6.clusteranno_SeuratObject.rds")
+```
+
+
+# List top10 genes expressed for each cluster
+
+
+## Find the markers that define each cluster, and use these to manually annotate the clusters (Wilcoxon method)
+Here we use their global function `findAllMarkers` to find markers that characterizes each cluster. A second pass looking at subclusters will be performed separately when we investigate the HTOs individually. 
+
+```{r find_markers, echo=FALSE, results='hide', fig.keep='all', message = FALSE, warning=FALSE}
+#finds markers for all clusters
+#(we use max.cells.per.ident to speed up the process)
+vdj.data.markers <- FindAllMarkers(vdj.data, max.cells.per.ident = 100, min.diff.pct = 0.3, only.pos = TRUE)
+head(vdj.data.markers)
+
+```
+
+
+```{r top10GEX, echo=FALSE}
+# show only top 10 for each cluster
+vdj.data.markers.top10 <- vdj.data.markers %>%
+  group_by(cluster) %>%
+  top_n(10, avg_log2FC)%>%
+  as.data.frame()
+# data is still out of order so we need to re-order the columns
+#select all rows, in the following column order for display (cluster, gene, other values)
+vdj.data.markers.top10<- vdj.data.markers.top10[,c(6,7,1:5)]
+head(vdj.data.markers.top10)
+#write to a csv file the top 20 genes for each cluster by FC value
+write.csv(vdj.data.markers.top10, file="top10_markers_of_each_cluster_by_coverage_fold_change.csv")
+```
+
+
+
+# Annotate clusters based on RNAseq data alone
+Since we have 5 samples in this experiment, it becomes really cumbersome to identify these clusters with a high level of certainty. A separate analysis of each sample (HTO) will give us a better understanding of these populations and their intrinsic characteristics. Here's the initial analysis attempt to annotate clusters based on highly expressed genes (which are not always a good gene marker for cell identity)
+
+```{r annotationstep1, echo=FALSE}
+#DimPlot(vdj.data, reduction = "umap", label = TRUE, pt.size = 0.5) 
+new.cluster.ids <- c("TCF7" , 
+                     "ENTPD1/ITGAE",  
+                     "ENO1" , 
+                     "CTL" , 
+                     "CD103/TRDC" , 
+                     "FCGR3A+ mono" , 
+                     "Treg" ,
+                     "FOSB",  
+                     "MIR155HG" , 
+                     "CD14+ monocytes" , 
+                     "B cells", 
+                     "Naive CD4+ T",
+                     "CD14+ mono",
+                     "NK")
+names(new.cluster.ids) <- levels(vdj.data)
+vdj.data <- RenameIdents(vdj.data, new.cluster.ids)
+DimPlot(vdj.data, reduction = "umap", label = TRUE, pt.size = 1) 
+```
+
+As we can see, annotating based on RNA only can be a challenge. From here on we are going to combine both RNA and ADT information based on the RNA cluster and try to resolve some of the issues with annotating clusters. Adding more information should help us feel more confident about the true identity of these clusters. We understand that algorithms also have a hard time dealing with cells of the same subtype (CD8+ cells and their different activation states for example), but we plan to perform that analysis when integrating cell trajectory later on.
+
+
+Another way to visualize a specific cell type of interest, like CD8 T cells, is using a dot plot where the size of the dot corresponds to the percentage of cells expressing the feature (genes in this case) of interest. The color represents the average expression level.
+
+The population named CD4+ seems to be a mixed population of T cells that are difficult to annotate.
+
+
+```{r dotplotall, echo=FALSE, message=FALSE, warning=FALSE}
+DotPlot(vdj.data, features = c("CD3D","CD8A","CD4", "CD19", "CD14", "TNFRSF18")) + RotatedAxis()
+
+```
+
+
+## CD8 T cells in more detail
+
+```{r CD8dotplot, echo=FALSE}
+DotPlot(vdj.data,features = c("CD8A","CD8B", "ITGAE", "ENTPD1", "TIGIT", "LAG3", "CTLA4", "TNFRSF18", "NKG7" )) + RotatedAxis()
+```
+
+## CD4 T Cells
+
+```{r CD4dotplot, echo=FALSE}
+DotPlot(vdj.data, features = c("CD4", "CCR7","TCF7", "IL7R", "FOXP3")) + RotatedAxis()
+#DotPlot(vdj.data, cols= "green", features = c("adt_CD3", "adt_CD4.1","adt_CD25", "adt_CD127")) + RotatedAxis()
+```
+
+
+```{r save7, echo=FALSE}
+saveRDS(vdj.data, file = "./7.allmarkers_SeuratObject.rds")
+```
+
+
+# ADT ANALYSIS
+
+For integration of the ADT data for a more robust understanding of protein and gene expression and classification of these populations, we ran the multimodal analysis based on the [multimodal vignette](https://satijalab.org/seurat/v3.0/multimodal_vignette.html)
+
+## Visualize protein levels on RNA clusters
+
+Violin plots showing the distribution of the ADT markers from our assay according to RNA annotated clusters (checking or concordance!) in the x-axis.
+
+
+```{r all_adt_Vln1, echo=FALSE, fig.width=12, fig.height=20}
+adt_markers_list1 <- c("adt_CD3" ,    "adt_CD4.1" ,  "adt_CD8"  ,   "adt_CD39" ,   "adt_CD103" ,  "adt_CD25" ,   "adt_CD127"  , "adt_CD19.1"  ,"adt_CD14.1" ,"adt_CD33.1" , "adt_CD11b" , "adt_CD11c"  , "adt_CD123"  , "adt_CD56"  ,  "adt_CD15"  ,  "adt_TCRgd", "adt_PD-1" ,   "adt_TIM-3" ,  "adt_PD-L1"  , "adt_OX40"  ,  "adt_ICOS.1" , "adt_CD69.1" , "adt_HLA-DR"  ,"adt_4-1BB" ,  "adt_CD71"  ,  "adt_GITR", "adt_CD161" )
+VlnPlot(object = vdj.data, assay="ADT", features = adt_markers_list1, pt.size = 0.1, ncol = 4)
+```
+
+
+### CD103+ cells
+
+```{r cd103, echo=FALSE, warning=FALSE, message=FALSE}
+plot_gitr2<- FeaturePlot(object = vdj.data,cols= c("lightgrey", "darkgreen"), features ="adt_CD103", pt.size = 0.2, ncol = 2)
+VlnPlot(object = vdj.data, features = "adt_CD103", pt.size = 0.1, ncol = 1)
+HoverLocator(plot = plot_gitr2, information = FetchData(vdj.data, vars = c("ident", "nCount_ADT", "nFeature_RNA")))
+```
+
+### CD39+ cells 
+
+```{r cd39, echo=FALSE, warning=FALSE, message=FALSE}
+plot_gitr2<- FeaturePlot(object = vdj.data,cols= c("lightgrey", "darkgreen"), features ="adt_CD39", pt.size = 0.2, ncol = 2)
+VlnPlot(object = vdj.data, features = "adt_CD39", pt.size = 0.1, ncol = 1)
+HoverLocator(plot = plot_gitr2, information = FetchData(vdj.data, vars = c("ident", "nCount_ADT", "nFeature_RNA")))
+```
+
+
+Plotting side-by-side CD103+/CD39+ cells and their respective protein and gene level and distribution across the clusters annotated with gene expression. We see a strong co-localization of these markers at both gene but especially at protein level. 
+
+```{r dp, echo=FALSE, fig.width=5.5, fig.height=3}
+FeaturePlot(object = vdj.data, features = c("adt_CD103", "ITGAE"), ncol =2)
+FeaturePlot(object = vdj.data, features = c("adt_CD39", "ENTPD1"), ncol =2)
+```
+
+
+##  Merging multiple graphs at both gene and protein level
+
+> protein & gene level expression of CD103+
+
+```{r gex_adtCD81, echo=FALSE, fig.width=10, fig.height=3.5}
+FeaturePlot(object = vdj.data, features = c("adt_CD103", "ITGAE"), blend=T)
+```
+
+> protein & gene level expression of CD39+
+
+```{r gexDP, echo=FALSE, fig.width=10, fig.height=3.5}
+FeaturePlot(object = vdj.data, features = c("adt_CD39", "ENTPD1"), blend=T)
+```
+
+
+> Protein levels of DP cells 
+
+```{r adtDP, echo=FALSE, fig.width=10, fig.height=3.5}
+FeaturePlot(object = vdj.data, features = c("adt_CD103", "adt_CD39"), blend=T)
+```
+
+> Gene levels of DP cells 
+
+```{r gex_DP, echo=FALSE, fig.width=10, fig.height=3.5}
+FeaturePlot(object = vdj.data, features = c("ITGAE", "ENTPD1"), blend=T)
+```
+
+### RidgePlot comparing ADT  and gene expression level across populations
+
+```{r echo=FALSE, message = FALSE, warning=FALSE}
+RidgePlot(vdj.data, features = c("adt_CD39", "ENTPD1"), log=T, ncol = 2)
+RidgePlot(vdj.data, features = c("adt_CD103",  "ITGAE"), log=T,ncol = 2)
+RidgePlot(vdj.data, features = c("adt_CD39",  "adt_CD103"), log=T,ncol = 2)
+RidgePlot(vdj.data, features = c("ITGAE",  "ENTPD1"), log=T,ncol = 2)
+```
+
+
+## View relationship between protein and RNA on same cells
+
+Pearson correlation between protein levels and gene levels on same cells.
+
+
+```{r echo=FALSE,fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+#In this analysis, I added the "slot" argument on the FeatureScatter function to scale the data 
+a <- FeatureScatter(object = vdj.data, feature1 = "adt_CD3", feature2 = "CD3E", slot = "scale.data") 
+b <- FeatureScatter(object = vdj.data, feature1 = "adt_CD8", feature2 = "CD8A", slot = "scale.data") 
+c <- FeatureScatter(object = vdj.data, feature1 = "adt_CD39", feature2 = "ENTPD1", slot = "scale.data") 
+d <-FeatureScatter(object = vdj.data, feature1 = "adt_CD103", feature2 = "ITGAE", slot = "scale.data")
+CombinePlots(plots = list(a,b, c, d), ncol = 2, legend = "none")
+```
+
+
+
+### Interactive plotting of ADTs
+
+Here, we plot protein levels of CD39 and CD103 double positive T cells and see how their distribution relates to the assigned clusters based on gene expression from those cells.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+dpPlot <- FeatureScatter(object = vdj.data, feature1 = "adt_CD103", feature2 = "adt_CD39") + RestoreLegend()
+dpPlot
+```
+
+Same plot but interactive visualization in a flow-like gating capability
+
+```{r hoverCD8plot, echo=FALSE, warning=FALSE, message=FALSE}
+HoverLocator(plot = dpPlot, information = FetchData(vdj.data, vars = c("ident", "nCount_ADT", "nFeature_RNA", "clonotype_id")))
+```
+
+
+
+# MULTIMODAL ANALYSIS USING ADT, GEX AND VDJ DATA
+
+This part of the analysis is partially based on the multimodal analysis [vignette](https://satijalab.org/seurat/v3.0/multimodal_vignette.html#add-the-protein-expression-levels-to-the-seurat-object) by Seurat's developers.
+
+## Identify differentially expressed proteins between clusters
+
+
+```{r FindAllMarkers, message= FALSE, warning= FALSE, echo=FALSE}
+#Downsample the clusters to a maximum of 300 cells each (makes the heatmap easier to see for small clusters)
+DefaultAssay(object = vdj.data) <- "ADT"
+adt.small <- subset(x = vdj.data, downsample = 300)
+#Find protein markers for all clusters, and draw a heatmap. 
+adt.markers <- FindAllMarkers(object = adt.small, assay = "ADT", only.pos = TRUE)
+```
+
+
+In this heatmap, we observe the concordance (or lack thereof) between our cluster annotation based on RNA data (columns) versus the expression level of some of the ADT markers (rows) used in the experiment. This might help resolve questions we most likely will have about specific clusters that are difficult to annotate. It's simply an added layer of information and it is based on the protein markers that have strongest signature in the dataset. 
+
+```{r Doheatmap, Warning= FALSE, echo=FALSE, fig.height=8, fig.width=8}
+DoHeatmap(object = adt.small, features = unique(x = adt.markers$gene), size= 2.0, assay = "ADT", angle = 90)  
+```
+
+ Now we use the collected information to rename clusters based on gene expression and protein (ADT levels) to help resolve uncertainty of sparce RNAseq data:
+ 
+```{r annotationstep, echo=FALSE}
+#DimPlot(vdj.data, reduction = "umap", label = TRUE, pt.size = 0.5) 
+new.cluster.ids <- c("TCF7" , 
+                     "DP",  
+                     "unknown" , 
+                     "CTL" , 
+                     "NK cells" , 
+                     "FCGR3A+ mono" , 
+                     "Treg" ,
+                     "MAIT",  
+                     "4-1BB" , 
+                     "CD14+ monocytes" , 
+                     "B cells", 
+                     "Naive CD4+ T",
+                     "CD14+ \nmono",
+                     "NK")
+names(new.cluster.ids) <- levels(vdj.data)
+vdj.data <- RenameIdents(vdj.data, new.cluster.ids)
+DimPlot(vdj.data, reduction = "umap", label = TRUE, pt.size = 1) 
+```
+
+ 
+
+## Cluster directly on protein levels
+
+We can also run dimensional reduction and graph-based clustering directly on CITE-seq data
+
+First, linear dimensionality reduction with PCA
+
+```{r echo=FALSE, message = FALSE, warning=FALSE}
+vdj.data
+vdj.data <- RunPCA(object = vdj.data, features = rownames(x = vdj.data), reduction.name = "pca_adt", reduction.key = "pca_adt_", verbose = FALSE)
+    
+DimPlot(object = vdj.data)
+```
+
+
+
+```{r getAssaydata, echo=FALSE}
+adt.data <- GetAssayData(vdj.data, slot = "data")
+adt.dist <- dist(x = t(x = adt.data))
+#Before we recluster the data on ADT levels, we'll stash the RNA cluster IDs for later
+vdj.data[["rnaClusterID"]] <- Idents(object = vdj.data)
+```
+
+
+Now, we rerun tSNE using our distance matrix defined only on ADT levels. The function `FindClusters` takes an argument called resolution that will determine how many communities (clusters) there will be on the plot. Here, I started with the parameter resolution = 0.2 as seen on the vignette, and it identified 13 communities with 96% certainty. If we increase the resolution it will find more communities, but decrease certainty and it will not necessarily help distinguish the clusters based on ADT. 
+
+
+```{r echo=FALSE, message = FALSE, warning=FALSE}
+vdj.data[["tsne_adt"]] <- RunTSNE(adt.dist, assay = "ADT", reduction.key = "adtTSNE_")
+vdj.data [["umap_adt"]]<- RunUMAP(adt.dist, assay = "ADT", umap.method = "uwot", metric = "cosine",  dims = 1:20, verbose = FALSE)
+vdj.data[["adt_snn"]] <- FindNeighbors(object = adt.dist)$snn
+vdj.data <- FindClusters(object = vdj.data, resolution = 0.2, graph.name = "adt_snn")
+```
+
+In this heatmap I explicitely selected all the markers we used in our ADT assay (rows) based on clustering on ADT data (columns). When we show ADT and RNA clustering side-by-side, they will reflect different data (RNA versus ADT) used for generating these clusters. 
+
+
+
+```{r echo=FALSE, fig.height=10, fig.width=10}
+adt.small2 <- subset(x = vdj.data, downsample = 500)
+DoHeatmap(object = adt.small2, features = c("CD3" ,    "CD4.1" ,  "CD8"  ,   "CD39" ,   "CD103" ,  "CD25" ,   "CD127"  , "CD19.1"  ,"CD14.1" ,"CD33.1" , "CD11b" , "CD11c"  , "CD123"  , "CD56"  ,  "CD15"  ,  "TCRgd", "PD-1" ,   "TIM-3" ,  "PD-L1", "OX40"  ,  "ICOS.1" , "CD69.1" , "HLA-DR" , "GITR" ,"4-1BB" ,  "CD71"  ,  "CD161"  ), size= 2.0, assay = "ADT", angle = 90)  
+```
+
+
+## Violin Plot of distribution of ADT markers 
+
+
+```{r all_adt_Vln2, echo=FALSE, fig.width=12, fig.height=20}
+adt_markers_list2 <- c("CD3" ,    "CD4.1" ,  "CD8"  ,   "CD39" ,   "CD103" ,  "CD25" ,   "CD127"  , "CD19.1"  ,"CD14.1" ,"CD33.1" , "CD11b" , "CD11c"  , "CD123"  , "CD56"  ,  "CD15"  ,  "TCRgd", "PD-1" ,   "TIM-3" ,  "PD-L1"  , "OX40"  ,  "ICOS.1" , "CD69.1" , "HLA-DR"  ,"4-1BB" ,  "CD71"  ,  "CD161"  )
+VlnPlot(object = vdj.data, features = adt_markers_list2, pt.size = 0.1, ncol = 4)
+```
+
+# Mapping ADTs on the RNA clusters
+
+Here, Seurat forces ADT data on the cluster structure of RNAseq and overlays the ADT expression based on the RNAseq clustering.
+
+As expected, based on gene expression, it is really hard to define T cell subtypes and we can see that the algorithm struggles with that task. Myeloid cells such as B cell, macrophages and DCs seem to suffer less and form nice clusters. 
+
+Interestingly, our target CD8 double positive (CD39/CD103) have their identity confirmed by both gene and protein expression and form a separate cluster from other T cells states. This could be due to a transient state phenomena of balance within the TME experienced by other subtypes that is not the case for our DP cells of interest, showing a level of transcriptional committment in terms of tissue residency which is our initial hypothesis. 
+
+```{r echo=FALSE, fig.width=12, fig.height=6, message=FALSE, warning=FALSE}
+#verify levels and rename clusters
+#levels(vdj.data)
+new.cluster.ids <- c("Treg CD127+", 
+                     "CD39+/CD103+", 
+                     "CD8 T cells", 
+                     "CD4 T cells" ,
+                     "Treg CD25+" ,
+                     "NK CD103+" ,
+                     "NK CD56+",
+                     "MAIT",
+                     "B cells", 
+                     "DC/Mono",
+                     "Treg 4-1BB",
+                     "pDC PD-L1",
+                     "TCRgd")
+names(new.cluster.ids) <- levels(vdj.data)
+vdj.data <- RenameIdents(vdj.data, new.cluster.ids)
+
+
+# stash the adt classification for using it later
+vdj.data[["adtClusterID"]] <- Idents(object = vdj.data)
+#run umap viz on rna data
+tsne_rnaClusters <- DimPlot(object = vdj.data, reduction = "umap", group.by = "rnaClusterID") 
+tsne_rnaClusters <- tsne_rnaClusters + ggtitle("Clustering based on scRNA-seq") + theme(plot.title = element_text(hjust = 0.5))
+tsne_rnaClusters <- LabelClusters(plot = tsne_rnaClusters, id = "rnaClusterID", size = 4)
+#run umap viz on adt data
+tsne_adtClusters <- DimPlot(object = vdj.data, reduction = "umap", pt.size = 0.5) 
+tsne_adtClusters <- tsne_adtClusters + ggtitle("Clustering based on ADT signal") + theme(plot.title = element_text(hjust = 0.5))
+tsne_adtClusters <- LabelClusters(plot = tsne_adtClusters, id = "ident", size = 4)
+CombinePlots(plots = list(tsne_rnaClusters, tsne_adtClusters), ncol = 2)
+```
+
+
+# Clonotype analysis of frequency among T cell populations
+
+Now, we are interested in the clonotype profile of these double positive T cells. According to _Duhen et al_, in their paper they used Adaptive technologies and found out that the TCR of these DP population was distinct from other subtypes of T cells. Here, we asked ourselves if the clonotypes with highest frequency in our dataset was that of our double positive CD8s. 
+
+Looking at the distribution of the most frequent clonotypes among cell populations based on RNA data, indeed we see that the top 10 most frequent clonotypes are DP cell. Clonotypes with highest frequency go from 1 (highest) to 9 (lowest). Another detail is that, as expected, the H&N cancer sample (HTO3) had the highest level of the most frequent clonotype, which is the double positive population identified by both single cell RNAseq and CITEseq.
+
+```{r bargraph2, echo=FALSE}
+#save metadata as a dataframe
+clono_tcells <- as.data.frame(vdj.data@meta.data)
+#dim(clono_tcells) #860 cells by 15 parameters
+clono_tcells <- clono_tcells[complete.cases(clono_tcells),]
+#clono_tcells
+#verify class of clonotype and switch to categorical if necessary
+#class(clono_tcells$clonotype_id)
+clono_tcells$clonotype_id <- as.factor(clono_tcells$clonotype_id)
+#class(clono_tcells$clonotype_id)
+
+
+# gene clusters 
+ggplot(clono_tcells, aes(x=rnaClusterID, label=clonotype_id, fill=clonotype_id)) +
+  geom_bar(width=0.6)+
+  labs(title="Enriched clonotype distribution across RNA annotated clusters") +
+  scale_fill_brewer(palette = "RdBu") +
+  theme(axis.text.x =element_text(angle=45, hjust=1))+
+  theme_classic() + coord_flip()
+
+# protein clusters 
+ggplot(clono_tcells, aes(x=adtClusterID, label=clonotype_id, fill=clonotype_id)) +
+  geom_bar(width=0.6)+
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(title="Enriched clonotype distribution across ADT annotated clusters") +
+  scale_fill_brewer(palette = "RdBu") +
+  theme_classic() + coord_flip()
+# gene clusters 
+ggplot(clono_tcells, aes(x=hash.ID, label=clonotype_id, fill=clonotype_id)) +
+  geom_bar(width=0.6) +
+  labs(title="Enriched clonotype distribution across hashtags") +
+  scale_fill_brewer(palette = "RdBu") +
+  theme(axis.text=element_text(angle=45, hjust=1))+
+  theme_classic() + coord_flip()
+```
+
+
+
+```{r save8, echo=FALSE, message = FALSE, warning = FALSE}
+saveRDS(vdj.data, file = "./8.RNA-ADT_SeuratObject.rds")
+```
